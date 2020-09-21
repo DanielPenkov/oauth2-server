@@ -1,144 +1,59 @@
 <?php
 /**
- * OAuth 2.0 Grant type interface.
+ * OAuth 2.0 Grant type interface
  *
+ * @package     league/oauth2-server
  * @author      Alex Bilbie <hello@alexbilbie.com>
  * @copyright   Copyright (c) Alex Bilbie
  * @license     http://mit-license.org/
- *
  * @link        https://github.com/thephpleague/oauth2-server
  */
 
 namespace League\OAuth2\Server\Grant;
 
-use DateInterval;
-use Defuse\Crypto\Key;
-use League\Event\EmitterAwareInterface;
-use League\OAuth2\Server\CryptKey;
-use League\OAuth2\Server\Repositories\AccessTokenRepositoryInterface;
-use League\OAuth2\Server\Repositories\ClientRepositoryInterface;
-use League\OAuth2\Server\Repositories\ScopeRepositoryInterface;
-use League\OAuth2\Server\RequestTypes\AuthorizationRequest;
-use League\OAuth2\Server\ResponseTypes\ResponseTypeInterface;
-use Psr\Http\Message\ServerRequestInterface;
+use League\OAuth2\Server\AuthorizationServer;
 
 /**
- * Grant type interface.
+ * Grant type interface
  */
-interface GrantTypeInterface extends EmitterAwareInterface
+interface GrantTypeInterface
 {
     /**
-     * Set refresh token TTL.
-     *
-     * @param DateInterval $refreshTokenTTL
-     */
-    public function setRefreshTokenTTL(DateInterval $refreshTokenTTL);
-
-    /**
-     * Return the grant identifier that can be used in matching up requests.
+     * Return the identifier
      *
      * @return string
      */
     public function getIdentifier();
 
     /**
-     * Respond to an incoming request.
+     * Return the identifier
      *
-     * @param ServerRequestInterface $request
-     * @param ResponseTypeInterface  $responseType
-     * @param DateInterval           $accessTokenTTL
+     * @param string $identifier
      *
-     * @return ResponseTypeInterface
+     * @return self
      */
-    public function respondToAccessTokenRequest(
-        ServerRequestInterface $request,
-        ResponseTypeInterface $responseType,
-        DateInterval $accessTokenTTL
-    );
+    public function setIdentifier($identifier);
 
     /**
-     * The grant type should return true if it is able to response to an authorization request
+     * Return the response type
      *
-     * @param ServerRequestInterface $request
-     *
-     * @return bool
+     * @return string
      */
-    public function canRespondToAuthorizationRequest(ServerRequestInterface $request);
+    public function getResponseType();
 
     /**
-     * If the grant can respond to an authorization request this method should be called to validate the parameters of
-     * the request.
+     * Inject the authorization server into the grant
      *
-     * If the validation is successful an AuthorizationRequest object will be returned. This object can be safely
-     * serialized in a user's session, and can be used during user authentication and authorization.
+     * @param \League\OAuth2\Server\AuthorizationServer $server The authorization server instance
      *
-     * @param ServerRequestInterface $request
-     *
-     * @return AuthorizationRequest
+     * @return self
      */
-    public function validateAuthorizationRequest(ServerRequestInterface $request);
+    public function setAuthorizationServer(AuthorizationServer $server);
 
     /**
-     * Once a user has authenticated and authorized the client the grant can complete the authorization request.
-     * The AuthorizationRequest object's $userId property must be set to the authenticated user and the
-     * $authorizationApproved property must reflect their desire to authorize or deny the client.
+     * Complete the grant flow
      *
-     * @param AuthorizationRequest $authorizationRequest
-     *
-     * @return ResponseTypeInterface
+     * @return array
      */
-    public function completeAuthorizationRequest(AuthorizationRequest $authorizationRequest);
-
-    /**
-     * The grant type should return true if it is able to respond to this request.
-     *
-     * For example most grant types will check that the $_POST['grant_type'] property matches it's identifier property.
-     *
-     * @param ServerRequestInterface $request
-     *
-     * @return bool
-     */
-    public function canRespondToAccessTokenRequest(ServerRequestInterface $request);
-
-    /**
-     * Set the client repository.
-     *
-     * @param ClientRepositoryInterface $clientRepository
-     */
-    public function setClientRepository(ClientRepositoryInterface $clientRepository);
-
-    /**
-     * Set the access token repository.
-     *
-     * @param AccessTokenRepositoryInterface $accessTokenRepository
-     */
-    public function setAccessTokenRepository(AccessTokenRepositoryInterface $accessTokenRepository);
-
-    /**
-     * Set the scope repository.
-     *
-     * @param ScopeRepositoryInterface $scopeRepository
-     */
-    public function setScopeRepository(ScopeRepositoryInterface $scopeRepository);
-
-    /**
-     * Set the default scope.
-     *
-     * @param string $scope
-     */
-    public function setDefaultScope($scope);
-
-    /**
-     * Set the path to the private key.
-     *
-     * @param CryptKey $privateKey
-     */
-    public function setPrivateKey(CryptKey $privateKey);
-
-    /**
-     * Set the encryption key
-     *
-     * @param string|Key|null $key
-     */
-    public function setEncryptionKey($key = null);
+    public function completeFlow();
 }

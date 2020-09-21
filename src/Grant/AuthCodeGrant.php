@@ -1,405 +1,303 @@
 <?php
 /**
+ * OAuth 2.0 Auth code grant
+ *
+ * @package     league/oauth2-server
  * @author      Alex Bilbie <hello@alexbilbie.com>
  * @copyright   Copyright (c) Alex Bilbie
  * @license     http://mit-license.org/
- *
  * @link        https://github.com/thephpleague/oauth2-server
  */
 
 namespace League\OAuth2\Server\Grant;
 
-use DateInterval;
-use DateTimeImmutable;
-use Exception;
-use League\OAuth2\Server\CodeChallengeVerifiers\CodeChallengeVerifierInterface;
-use League\OAuth2\Server\CodeChallengeVerifiers\PlainVerifier;
-use League\OAuth2\Server\CodeChallengeVerifiers\S256Verifier;
-use League\OAuth2\Server\Entities\ClientEntityInterface;
-use League\OAuth2\Server\Entities\UserEntityInterface;
-use League\OAuth2\Server\Exception\OAuthServerException;
-use League\OAuth2\Server\Repositories\AuthCodeRepositoryInterface;
-use League\OAuth2\Server\Repositories\RefreshTokenRepositoryInterface;
-use League\OAuth2\Server\RequestEvent;
-use League\OAuth2\Server\RequestTypes\AuthorizationRequest;
-use League\OAuth2\Server\ResponseTypes\RedirectResponse;
-use League\OAuth2\Server\ResponseTypes\ResponseTypeInterface;
-use LogicException;
-use Psr\Http\Message\ServerRequestInterface;
-use stdClass;
+use League\OAuth2\Server\Entity\AccessTokenEntity;
+use League\OAuth2\Server\Entity\AuthCodeEntity;
+use League\OAuth2\Server\Entity\ClientEntity;
+use League\OAuth2\Server\Entity\RefreshTokenEntity;
+use League\OAuth2\Server\Entity\SessionEntity;
+use League\OAuth2\Server\Event;
+use League\OAuth2\Server\Exception;
+use League\OAuth2\Server\Util\SecureKey;
 
-class AuthCodeGrant extends AbstractAuthorizeGrant
+/**
+ * Auth code grant class
+ */
+class AuthCodeGrant extends AbstractGrant
 {
     /**
-     * @var DateInterval
-     */
-    private $authCodeTTL;
-
-    /**
-     * @var bool
-     */
-    private $requireCodeChallengeForPublicClients = true;
-
-    /**
-     * @var CodeChallengeVerifierInterface[]
-     */
-    private $codeChallengeVerifiers = [];
-
-    /**
-     * @param AuthCodeRepositoryInterface     $authCodeRepository
-     * @param RefreshTokenRepositoryInterface $refreshTokenRepository
-     * @param DateInterval                    $authCodeTTL
+     * Grant identifier
      *
-     * @throws Exception
+     * @var string
      */
-    public function __construct(
-        AuthCodeRepositoryInterface $authCodeRepository,
-        RefreshTokenRepositoryInterface $refreshTokenRepository,
-        DateInterval $authCodeTTL
-    ) {
-        $this->setAuthCodeRepository($authCodeRepository);
-        $this->setRefreshTokenRepository($refreshTokenRepository);
-        $this->authCodeTTL = $authCodeTTL;
-        $this->refreshTokenTTL = new DateInterval('P1M');
-
-        if (\in_array('sha256', \hash_algos(), true)) {
-            $s256Verifier = new S256Verifier();
-            $this->codeChallengeVerifiers[$s256Verifier->getMethod()] = $s256Verifier;
-        }
-
-        $plainVerifier = new PlainVerifier();
-        $this->codeChallengeVerifiers[$plainVerifier->getMethod()] = $plainVerifier;
-    }
+    protected $identifier = 'authorization_code';
 
     /**
-     * Disable the requirement for a code challenge for public clients.
+     * Response type
+     *
+     * @var string
      */
-    public function disableRequireCodeChallengeForPublicClients()
+    protected $responseType = 'code';
+
+    /**
+     * AuthServer instance
+     *
+     * @var \League\OAuth2\Server\AuthorizationServer
+     */
+    protected $server = null;
+
+    /**
+     * Access token expires in override
+     *
+     * @var int
+     */
+    protected $accessTokenTTL = null;
+
+    /**
+     * The TTL of the auth token
+     *
+     * @var integer
+     */
+    protected $authTokenTTL = 600;
+
+    /**
+     * Whether to require the client secret when
+     * completing the flow.
+     *
+     * @var boolean
+     */
+    protected $requireClientSecret = true;
+
+    /**
+     * Override the default access token expire time
+     *
+     * @param int $authTokenTTL
+     *
+     * @return void
+     */
+    public function setAuthTokenTTL($authTokenTTL)
     {
-        $this->requireCodeChallengeForPublicClients = false;
+        $this->authTokenTTL = $authTokenTTL;
     }
 
     /**
-     * Respond to an access token request.
      *
-     * @param ServerRequestInterface $request
-     * @param ResponseTypeInterface  $responseType
-     * @param DateInterval           $accessTokenTTL
-     *
-     * @throws OAuthServerException
-     *
-     * @return ResponseTypeInterface
+     * @param bool $required True to require client secret during access
+     *                       token request. False if not. Default = true
      */
-    public function respondToAccessTokenRequest(
-        ServerRequestInterface $request,
-        ResponseTypeInterface $responseType,
-        DateInterval $accessTokenTTL
-    ) {
-        list($clientId) = $this->getClientCredentials($request);
-
-        $client = $this->getClientEntityOrFail($clientId, $request);
-
-        // Only validate the client if it is confidential
-        if ($client->isConfidential()) {
-            $this->validateClient($request);
-        }
-
-        $encryptedAuthCode = $this->getRequestParameter('code', $request, null);
-
-        if ($encryptedAuthCode === null) {
-            throw OAuthServerException::invalidRequest('code');
-        }
-
-        try {
-            $authCodePayload = \json_decode($this->decrypt($encryptedAuthCode));
-
-            $this->validateAuthorizationCode($authCodePayload, $client, $request);
-
-            $scopes = $this->scopeRepository->finalizeScopes(
-                $this->validateScopes($authCodePayload->scopes),
-                $this->getIdentifier(),
-                $client,
-                $authCodePayload->user_id
-            );
-        } catch (LogicException $e) {
-            throw OAuthServerException::invalidRequest('code', 'Cannot decrypt the authorization code', $e);
-        }
-
-        // Validate code challenge
-        if (!empty($authCodePayload->code_challenge)) {
-            $codeVerifier = $this->getRequestParameter('code_verifier', $request, null);
-
-            if ($codeVerifier === null) {
-                throw OAuthServerException::invalidRequest('code_verifier');
-            }
-
-            // Validate code_verifier according to RFC-7636
-            // @see: https://tools.ietf.org/html/rfc7636#section-4.1
-            if (\preg_match('/^[A-Za-z0-9-._~]{43,128}$/', $codeVerifier) !== 1) {
-                throw OAuthServerException::invalidRequest(
-                    'code_verifier',
-                    'Code Verifier must follow the specifications of RFC-7636.'
-                );
-            }
-
-            if (\property_exists($authCodePayload, 'code_challenge_method')) {
-                if (isset($this->codeChallengeVerifiers[$authCodePayload->code_challenge_method])) {
-                    $codeChallengeVerifier = $this->codeChallengeVerifiers[$authCodePayload->code_challenge_method];
-
-                    if ($codeChallengeVerifier->verifyCodeChallenge($codeVerifier, $authCodePayload->code_challenge) === false) {
-                        throw OAuthServerException::invalidGrant('Failed to verify `code_verifier`.');
-                    }
-                } else {
-                    throw OAuthServerException::serverError(
-                        \sprintf(
-                            'Unsupported code challenge method `%s`',
-                            $authCodePayload->code_challenge_method
-                        )
-                    );
-                }
-            }
-        }
-
-        // Issue and persist new access token
-        $accessToken = $this->issueAccessToken($accessTokenTTL, $client, $authCodePayload->user_id, $scopes);
-        $this->getEmitter()->emit(new RequestEvent(RequestEvent::ACCESS_TOKEN_ISSUED, $request));
-        $responseType->setAccessToken($accessToken);
-
-        // Issue and persist new refresh token if given
-        $refreshToken = $this->issueRefreshToken($accessToken);
-
-        if ($refreshToken !== null) {
-            $this->getEmitter()->emit(new RequestEvent(RequestEvent::REFRESH_TOKEN_ISSUED, $request));
-            $responseType->setRefreshToken($refreshToken);
-        }
-
-        // Revoke used auth code
-        $this->authCodeRepository->revokeAuthCode($authCodePayload->auth_code_id);
-
-        return $responseType;
-    }
-
-    /**
-     * Validate the authorization code.
-     *
-     * @param stdClass               $authCodePayload
-     * @param ClientEntityInterface  $client
-     * @param ServerRequestInterface $request
-     */
-    private function validateAuthorizationCode(
-        $authCodePayload,
-        ClientEntityInterface $client,
-        ServerRequestInterface $request
-    ) {
-        if (!\property_exists($authCodePayload, 'auth_code_id')) {
-            throw OAuthServerException::invalidRequest('code', 'Authorization code malformed');
-        }
-
-        if (\time() > $authCodePayload->expire_time) {
-            throw OAuthServerException::invalidRequest('code', 'Authorization code has expired');
-        }
-
-        if ($this->authCodeRepository->isAuthCodeRevoked($authCodePayload->auth_code_id) === true) {
-            throw OAuthServerException::invalidRequest('code', 'Authorization code has been revoked');
-        }
-
-        if ($authCodePayload->client_id !== $client->getIdentifier()) {
-            throw OAuthServerException::invalidRequest('code', 'Authorization code was not issued to this client');
-        }
-
-        // The redirect URI is required in this request
-        $redirectUri = $this->getRequestParameter('redirect_uri', $request, null);
-        if (empty($authCodePayload->redirect_uri) === false && $redirectUri === null) {
-            throw OAuthServerException::invalidRequest('redirect_uri');
-        }
-
-        if ($authCodePayload->redirect_uri !== $redirectUri) {
-            throw OAuthServerException::invalidRequest('redirect_uri', 'Invalid redirect URI');
-        }
-    }
-
-    /**
-     * Return the grant identifier that can be used in matching up requests.
-     *
-     * @return string
-     */
-    public function getIdentifier()
+    public function setRequireClientSecret($required)
     {
-        return 'authorization_code';
+        $this->requireClientSecret = $required;
     }
 
     /**
-     * {@inheritdoc}
+     * True if client secret is required during
+     * access token request. False if it isn't.
+     *
+     * @return bool
      */
-    public function canRespondToAuthorizationRequest(ServerRequestInterface $request)
+    public function shouldRequireClientSecret()
     {
-        return (
-            \array_key_exists('response_type', $request->getQueryParams())
-            && $request->getQueryParams()['response_type'] === 'code'
-            && isset($request->getQueryParams()['client_id'])
-        );
+        return $this->requireClientSecret;
     }
 
     /**
-     * {@inheritdoc}
+     * Check authorize parameters
+     *
+     * @return array Authorize request parameters
+     *
+     * @throws
      */
-    public function validateAuthorizationRequest(ServerRequestInterface $request)
+    public function checkAuthorizeParams()
     {
-        $clientId = $this->getQueryStringParameter(
-            'client_id',
-            $request,
-            $this->getServerParameter('PHP_AUTH_USER', $request)
+        // Get required params
+        $clientId = $this->server->getRequest()->query->get('client_id', null);
+        if (is_null($clientId)) {
+            throw new Exception\InvalidRequestException('client_id');
+        }
+
+        $redirectUri = $this->server->getRequest()->query->get('redirect_uri', null);
+        if (is_null($redirectUri)) {
+            throw new Exception\InvalidRequestException('redirect_uri');
+        }
+
+        // Validate client ID and redirect URI
+        $client = $this->server->getClientStorage()->get(
+            $clientId,
+            null,
+            $redirectUri,
+            $this->getIdentifier()
         );
 
-        if ($clientId === null) {
-            throw OAuthServerException::invalidRequest('client_id');
+        if (($client instanceof ClientEntity) === false) {
+            $this->server->getEventEmitter()->emit(new Event\ClientAuthenticationFailedEvent($this->server->getRequest()));
+            throw new Exception\InvalidClientException();
         }
 
-        $client = $this->getClientEntityOrFail($clientId, $request);
-
-        $redirectUri = $this->getQueryStringParameter('redirect_uri', $request);
-
-        if ($redirectUri !== null) {
-            $this->validateRedirectUri($redirectUri, $client, $request);
-        } elseif (empty($client->getRedirectUri()) ||
-            (\is_array($client->getRedirectUri()) && \count($client->getRedirectUri()) !== 1)) {
-            $this->getEmitter()->emit(new RequestEvent(RequestEvent::CLIENT_AUTHENTICATION_FAILED, $request));
-            throw OAuthServerException::invalidClient($request);
+        $state = $this->server->getRequest()->query->get('state', null);
+        if ($this->server->stateParamRequired() === true && is_null($state)) {
+            throw new Exception\InvalidRequestException('state', $redirectUri);
         }
 
-        $defaultClientRedirectUri = \is_array($client->getRedirectUri())
-            ? $client->getRedirectUri()[0]
-            : $client->getRedirectUri();
-
-        $scopes = $this->validateScopes(
-            $this->getQueryStringParameter('scope', $request, $this->defaultScope),
-            $redirectUri ?? $defaultClientRedirectUri
-        );
-
-        $stateParameter = $this->getQueryStringParameter('state', $request);
-
-        $authorizationRequest = new AuthorizationRequest();
-        $authorizationRequest->setGrantTypeId($this->getIdentifier());
-        $authorizationRequest->setClient($client);
-        $authorizationRequest->setRedirectUri($redirectUri);
-
-        if ($stateParameter !== null) {
-            $authorizationRequest->setState($stateParameter);
+        $responseType = $this->server->getRequest()->query->get('response_type', null);
+        if (is_null($responseType)) {
+            throw new Exception\InvalidRequestException('response_type', $redirectUri);
         }
 
-        $authorizationRequest->setScopes($scopes);
-
-        $codeChallenge = $this->getQueryStringParameter('code_challenge', $request);
-
-        if ($codeChallenge !== null) {
-            $codeChallengeMethod = $this->getQueryStringParameter('code_challenge_method', $request, 'plain');
-
-            if (\array_key_exists($codeChallengeMethod, $this->codeChallengeVerifiers) === false) {
-                throw OAuthServerException::invalidRequest(
-                    'code_challenge_method',
-                    'Code challenge method must be one of ' . \implode(', ', \array_map(
-                        function ($method) {
-                            return '`' . $method . '`';
-                        },
-                        \array_keys($this->codeChallengeVerifiers)
-                    ))
-                );
-            }
-
-            // Validate code_challenge according to RFC-7636
-            // @see: https://tools.ietf.org/html/rfc7636#section-4.2
-            if (\preg_match('/^[A-Za-z0-9-._~]{43,128}$/', $codeChallenge) !== 1) {
-                throw OAuthServerException::invalidRequest(
-                    'code_challenge',
-                    'Code challenge must follow the specifications of RFC-7636.'
-                );
-            }
-
-            $authorizationRequest->setCodeChallenge($codeChallenge);
-            $authorizationRequest->setCodeChallengeMethod($codeChallengeMethod);
-        } elseif ($this->requireCodeChallengeForPublicClients && !$client->isConfidential()) {
-            throw OAuthServerException::invalidRequest('code_challenge', 'Code challenge must be provided for public clients');
+        // Ensure response type is one that is recognised
+        if (!in_array($responseType, $this->server->getResponseTypes())) {
+            throw new Exception\UnsupportedResponseTypeException($responseType, $redirectUri);
         }
 
-        return $authorizationRequest;
+        // Validate any scopes that are in the request
+        $scopeParam = $this->server->getRequest()->query->get('scope', '');
+        $scopes = $this->validateScopes($scopeParam, $client, $redirectUri);
+
+        return [
+            'client'        => $client,
+            'redirect_uri'  => $redirectUri,
+            'state'         => $state,
+            'response_type' => $responseType,
+            'scopes'        => $scopes
+        ];
     }
 
     /**
-     * {@inheritdoc}
+     * Parse a new authorize request
+     *
+     * @param string $type       The session owner's type
+     * @param string $typeId     The session owner's ID
+     * @param array  $authParams The authorize request $_GET parameters
+     *
+     * @return string An authorisation code
      */
-    public function completeAuthorizationRequest(AuthorizationRequest $authorizationRequest)
+    public function newAuthorizeRequest($type, $typeId, $authParams = [])
     {
-        if ($authorizationRequest->getUser() instanceof UserEntityInterface === false) {
-            throw new LogicException('An instance of UserEntityInterface should be set on the AuthorizationRequest');
+        // Create a new session
+        $session = new SessionEntity($this->server);
+        $session->setOwner($type, $typeId);
+        $session->associateClient($authParams['client']);
+
+        // Create a new auth code
+        $authCode = new AuthCodeEntity($this->server);
+        $authCode->setId(SecureKey::generate());
+        $authCode->setRedirectUri($authParams['redirect_uri']);
+        $authCode->setExpireTime(time() + $this->authTokenTTL);
+
+        foreach ($authParams['scopes'] as $scope) {
+            $authCode->associateScope($scope);
+            $session->associateScope($scope);
         }
 
-        $finalRedirectUri = $authorizationRequest->getRedirectUri()
-                          ?? $this->getClientRedirectUri($authorizationRequest);
+        $session->save();
+        $authCode->setSession($session);
+        $authCode->save();
 
-        // The user approved the client, redirect them back with an auth code
-        if ($authorizationRequest->isAuthorizationApproved() === true) {
-            $authCode = $this->issueAuthCode(
-                $this->authCodeTTL,
-                $authorizationRequest->getClient(),
-                $authorizationRequest->getUser()->getIdentifier(),
-                $authorizationRequest->getRedirectUri(),
-                $authorizationRequest->getScopes()
-            );
-
-            $payload = [
-                'client_id'             => $authCode->getClient()->getIdentifier(),
-                'redirect_uri'          => $authCode->getRedirectUri(),
-                'auth_code_id'          => $authCode->getIdentifier(),
-                'scopes'                => $authCode->getScopes(),
-                'user_id'               => $authCode->getUserIdentifier(),
-                'expire_time'           => (new DateTimeImmutable())->add($this->authCodeTTL)->getTimestamp(),
-                'code_challenge'        => $authorizationRequest->getCodeChallenge(),
-                'code_challenge_method' => $authorizationRequest->getCodeChallengeMethod(),
-            ];
-
-            $jsonPayload = \json_encode($payload);
-
-            if ($jsonPayload === false) {
-                throw new LogicException('An error was encountered when JSON encoding the authorization request response');
-            }
-
-            $response = new RedirectResponse();
-            $response->setRedirectUri(
-                $this->makeRedirectUri(
-                    $finalRedirectUri,
-                    [
-                        'code'  => $this->encrypt($jsonPayload),
-                        'state' => $authorizationRequest->getState(),
-                    ]
-                )
-            );
-
-            return $response;
-        }
-
-        // The user denied the client, redirect them back with an error
-        throw OAuthServerException::accessDenied(
-            'The user denied the request',
-            $this->makeRedirectUri(
-                $finalRedirectUri,
-                [
-                    'state' => $authorizationRequest->getState(),
-                ]
-            )
-        );
+        return $authCode->generateRedirectUri($authParams['state']);
     }
 
     /**
-     * Get the client redirect URI if not set in the request.
+     * Complete the auth code grant
      *
-     * @param AuthorizationRequest $authorizationRequest
+     * @return array
      *
-     * @return string
+     * @throws
      */
-    private function getClientRedirectUri(AuthorizationRequest $authorizationRequest)
+    public function completeFlow()
     {
-        return \is_array($authorizationRequest->getClient()->getRedirectUri())
-                ? $authorizationRequest->getClient()->getRedirectUri()[0]
-                : $authorizationRequest->getClient()->getRedirectUri();
+        // Get the required params
+        $clientId = $this->server->getRequest()->get('client_id', $this->server->getRequest()->getUser());
+        if (is_null($clientId)) {
+            throw new Exception\InvalidRequestException('client_id');
+        }
+
+        $clientSecret = $this->server->getRequest()->get('client_secret',
+            $this->server->getRequest()->getPassword());
+        if ($this->shouldRequireClientSecret() && is_null($clientSecret)) {
+            throw new Exception\InvalidRequestException('client_secret');
+        }
+
+        $redirectUri = $this->server->getRequest()->get('redirect_uri', null);
+        if (is_null($redirectUri)) {
+            throw new Exception\InvalidRequestException('redirect_uri');
+        }
+
+        // Validate client ID and client secret
+        $client = $this->server->getClientStorage()->get(
+            $clientId,
+            $clientSecret,
+            $redirectUri,
+            $this->getIdentifier()
+        );
+
+        if (($client instanceof ClientEntity) === false) {
+            $this->server->getEventEmitter()->emit(new Event\ClientAuthenticationFailedEvent($this->server->getRequest()));
+            throw new Exception\InvalidClientException();
+        }
+
+        // Validate the auth code
+        $authCode = $this->server->getRequest()->get('code', null);
+        if (is_null($authCode)) {
+            throw new Exception\InvalidRequestException('code');
+        }
+
+        $code = $this->server->getAuthCodeStorage()->get($authCode);
+        if (($code instanceof AuthCodeEntity) === false) {
+            throw new Exception\InvalidRequestException('code');
+        }
+
+        // Ensure the auth code hasn't expired
+        if ($code->isExpired() === true) {
+            throw new Exception\InvalidRequestException('code');
+        }
+
+        // Check redirect URI presented matches redirect URI originally used in authorize request
+        if ($code->getRedirectUri() !== $redirectUri) {
+            throw new Exception\InvalidRequestException('redirect_uri');
+        }
+
+        $session = $code->getSession();
+        $session->associateClient($client);
+
+        $authCodeScopes = $code->getScopes();
+
+        // Generate the access token
+        $accessToken = new AccessTokenEntity($this->server);
+        $accessToken->setId(SecureKey::generate());
+        $accessToken->setExpireTime($this->getAccessTokenTTL() + time());
+
+        foreach ($authCodeScopes as $authCodeScope) {
+            $session->associateScope($authCodeScope);
+        }
+
+        foreach ($session->getScopes() as $scope) {
+            $accessToken->associateScope($scope);
+        }
+
+        $this->server->getTokenType()->setSession($session);
+        $this->server->getTokenType()->setParam('access_token', $accessToken->getId());
+        $this->server->getTokenType()->setParam('expires_in', $this->getAccessTokenTTL());
+
+        // Associate a refresh token if set
+        if ($this->server->hasGrantType('refresh_token')) {
+            $refreshToken = new RefreshTokenEntity($this->server);
+            $refreshToken->setId(SecureKey::generate());
+            $refreshToken->setExpireTime($this->server->getGrantType('refresh_token')->getRefreshTokenTTL() + time());
+            $this->server->getTokenType()->setParam('refresh_token', $refreshToken->getId());
+        }
+
+        // Expire the auth code
+        $code->expire();
+
+        // Save all the things
+        $accessToken->setSession($session);
+        $accessToken->save();
+
+        if (isset($refreshToken) && $this->server->hasGrantType('refresh_token')) {
+            $refreshToken->setAccessToken($accessToken);
+            $refreshToken->save();
+        }
+
+        return $this->server->getTokenType()->generateResponse();
     }
 }

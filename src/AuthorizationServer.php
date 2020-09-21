@@ -1,236 +1,295 @@
 <?php
 /**
+ * OAuth 2.0 Authorization Server
+ *
+ * @package     league/oauth2-server
  * @author      Alex Bilbie <hello@alexbilbie.com>
  * @copyright   Copyright (c) Alex Bilbie
  * @license     http://mit-license.org/
- *
  * @link        https://github.com/thephpleague/oauth2-server
  */
 
 namespace League\OAuth2\Server;
 
-use DateInterval;
-use Defuse\Crypto\Key;
-use League\Event\EmitterAwareInterface;
-use League\Event\EmitterAwareTrait;
-use League\OAuth2\Server\Exception\OAuthServerException;
 use League\OAuth2\Server\Grant\GrantTypeInterface;
-use League\OAuth2\Server\Repositories\AccessTokenRepositoryInterface;
-use League\OAuth2\Server\Repositories\ClientRepositoryInterface;
-use League\OAuth2\Server\Repositories\ScopeRepositoryInterface;
-use League\OAuth2\Server\RequestTypes\AuthorizationRequest;
-use League\OAuth2\Server\ResponseTypes\AbstractResponseType;
-use League\OAuth2\Server\ResponseTypes\BearerTokenResponse;
-use League\OAuth2\Server\ResponseTypes\ResponseTypeInterface;
-use Psr\Http\Message\ResponseInterface;
-use Psr\Http\Message\ServerRequestInterface;
+use League\OAuth2\Server\TokenType\Bearer;
 
-class AuthorizationServer implements EmitterAwareInterface
+/**
+ * OAuth 2.0 authorization server class
+ */
+class AuthorizationServer extends AbstractServer
 {
-    use EmitterAwareTrait;
-
     /**
-     * @var GrantTypeInterface[]
-     */
-    protected $enabledGrantTypes = [];
-
-    /**
-     * @var DateInterval[]
-     */
-    protected $grantTypeAccessTokenTTL = [];
-
-    /**
-     * @var CryptKey
-     */
-    protected $privateKey;
-
-    /**
-     * @var CryptKey
-     */
-    protected $publicKey;
-
-    /**
-     * @var ResponseTypeInterface
-     */
-    protected $responseType;
-
-    /**
-     * @var ClientRepositoryInterface
-     */
-    private $clientRepository;
-
-    /**
-     * @var AccessTokenRepositoryInterface
-     */
-    private $accessTokenRepository;
-
-    /**
-     * @var ScopeRepositoryInterface
-     */
-    private $scopeRepository;
-
-    /**
-     * @var string|Key
-     */
-    private $encryptionKey;
-
-    /**
+     * The delimiter between scopes specified in the scope query string parameter
+     * The OAuth 2 specification states it should be a space but most use a comma
+     *
      * @var string
      */
-    private $defaultScope = '';
+    protected $scopeDelimiter = ' ';
 
     /**
-     * New server instance.
+     * The TTL (time to live) of an access token in seconds (default: 3600)
      *
-     * @param ClientRepositoryInterface      $clientRepository
-     * @param AccessTokenRepositoryInterface $accessTokenRepository
-     * @param ScopeRepositoryInterface       $scopeRepository
-     * @param CryptKey|string                $privateKey
-     * @param string|Key                     $encryptionKey
-     * @param null|ResponseTypeInterface     $responseType
+     * @var integer
      */
-    public function __construct(
-        ClientRepositoryInterface $clientRepository,
-        AccessTokenRepositoryInterface $accessTokenRepository,
-        ScopeRepositoryInterface $scopeRepository,
-        $privateKey,
-        $encryptionKey,
-        ResponseTypeInterface $responseType = null
-    ) {
-        $this->clientRepository = $clientRepository;
-        $this->accessTokenRepository = $accessTokenRepository;
-        $this->scopeRepository = $scopeRepository;
+    protected $accessTokenTTL = 3600;
 
-        if ($privateKey instanceof CryptKey === false) {
-            $privateKey = new CryptKey($privateKey);
-        }
+    /**
+     * The registered grant response types
+     *
+     * @var array
+     */
+    protected $responseTypes = [];
 
-        $this->privateKey = $privateKey;
-        $this->encryptionKey = $encryptionKey;
+    /**
+     * The registered grant types
+     *
+     * @var array
+     */
+    protected $grantTypes = [];
 
-        if ($responseType === null) {
-            $responseType = new BearerTokenResponse();
-        } else {
-            $responseType = clone $responseType;
-        }
+    /**
+     * Require the "scope" parameter to be in checkAuthoriseParams()
+     *
+     * @var boolean
+     */
+    protected $requireScopeParam = false;
 
-        $this->responseType = $responseType;
+    /**
+     * Default scope(s) to be used if none is provided
+     *
+     * @var string|array
+     */
+    protected $defaultScope;
+
+    /**
+     * Require the "state" parameter to be in checkAuthoriseParams()
+     *
+     * @var boolean
+     */
+    protected $requireStateParam = false;
+
+    /**
+     * Create a new OAuth2 authorization server
+     *
+     * @return self
+     */
+    public function __construct()
+    {
+        // Set Bearer as the default token type
+        $this->setTokenType(new Bearer());
+
+        parent::__construct();
+
+        return $this;
     }
 
     /**
-     * Enable a grant type on the server.
+     * Enable support for a grant
      *
-     * @param GrantTypeInterface $grantType
-     * @param null|DateInterval  $accessTokenTTL
+     * @param GrantTypeInterface $grantType  A grant class which conforms to Interface/GrantTypeInterface
+     * @param null|string        $identifier An identifier for the grant (autodetected if not passed)
+     *
+     * @return self
      */
-    public function enableGrantType(GrantTypeInterface $grantType, DateInterval $accessTokenTTL = null)
+    public function addGrantType(GrantTypeInterface $grantType, $identifier = null)
     {
-        if ($accessTokenTTL === null) {
-            $accessTokenTTL = new DateInterval('PT1H');
+        if (is_null($identifier)) {
+            $identifier = $grantType->getIdentifier();
         }
 
-        $grantType->setAccessTokenRepository($this->accessTokenRepository);
-        $grantType->setClientRepository($this->clientRepository);
-        $grantType->setScopeRepository($this->scopeRepository);
-        $grantType->setDefaultScope($this->defaultScope);
-        $grantType->setPrivateKey($this->privateKey);
-        $grantType->setEmitter($this->getEmitter());
-        $grantType->setEncryptionKey($this->encryptionKey);
+        // Inject server into grant
+        $grantType->setAuthorizationServer($this);
 
-        $this->enabledGrantTypes[$grantType->getIdentifier()] = $grantType;
-        $this->grantTypeAccessTokenTTL[$grantType->getIdentifier()] = $accessTokenTTL;
-    }
+        $this->grantTypes[$identifier] = $grantType;
 
-    /**
-     * Validate an authorization request
-     *
-     * @param ServerRequestInterface $request
-     *
-     * @throws OAuthServerException
-     *
-     * @return AuthorizationRequest
-     */
-    public function validateAuthorizationRequest(ServerRequestInterface $request)
-    {
-        foreach ($this->enabledGrantTypes as $grantType) {
-            if ($grantType->canRespondToAuthorizationRequest($request)) {
-                return $grantType->validateAuthorizationRequest($request);
-            }
+        if (!is_null($grantType->getResponseType())) {
+            $this->responseTypes[] = $grantType->getResponseType();
         }
 
-        throw OAuthServerException::unsupportedGrantType();
+        return $this;
     }
 
     /**
-     * Complete an authorization request
+     * Check if a grant type has been enabled
      *
-     * @param AuthorizationRequest $authRequest
-     * @param ResponseInterface    $response
+     * @param string $identifier The grant type identifier
      *
-     * @return ResponseInterface
+     * @return boolean Returns "true" if enabled, "false" if not
      */
-    public function completeAuthorizationRequest(AuthorizationRequest $authRequest, ResponseInterface $response)
+    public function hasGrantType($identifier)
     {
-        return $this->enabledGrantTypes[$authRequest->getGrantTypeId()]
-            ->completeAuthorizationRequest($authRequest)
-            ->generateHttpResponse($response);
+        return (array_key_exists($identifier, $this->grantTypes));
     }
 
     /**
-     * Return an access token response.
+     * Returns response types
      *
-     * @param ServerRequestInterface $request
-     * @param ResponseInterface      $response
-     *
-     * @throws OAuthServerException
-     *
-     * @return ResponseInterface
+     * @return array
      */
-    public function respondToAccessTokenRequest(ServerRequestInterface $request, ResponseInterface $response)
+    public function getResponseTypes()
     {
-        foreach ($this->enabledGrantTypes as $grantType) {
-            if (!$grantType->canRespondToAccessTokenRequest($request)) {
-                continue;
-            }
-            $tokenResponse = $grantType->respondToAccessTokenRequest(
-                $request,
-                $this->getResponseType(),
-                $this->grantTypeAccessTokenTTL[$grantType->getIdentifier()]
-            );
+        return $this->responseTypes;
+    }
 
-            if ($tokenResponse instanceof ResponseTypeInterface) {
-                return $tokenResponse->generateHttpResponse($response);
-            }
+    /**
+     * Require the "scope" parameter in checkAuthoriseParams()
+     *
+     * @param boolean $require
+     *
+     * @return self
+     */
+    public function requireScopeParam($require = true)
+    {
+        $this->requireScopeParam = $require;
+
+        return $this;
+    }
+
+    /**
+     * Is the scope parameter required?
+     *
+     * @return bool
+     */
+    public function scopeParamRequired()
+    {
+        return $this->requireScopeParam;
+    }
+
+    /**
+     * Default scope to be used if none is provided and requireScopeParam() is false
+     *
+     * @param string $default Name of the default scope
+     *
+     * @return self
+     */
+    public function setDefaultScope($default = null)
+    {
+        $this->defaultScope = $default;
+
+        return $this;
+    }
+
+    /**
+     * Default scope to be used if none is provided and requireScopeParam is false
+     *
+     * @return string|null
+     */
+    public function getDefaultScope()
+    {
+        return $this->defaultScope;
+    }
+
+    /**
+     * Require the "state" parameter in checkAuthoriseParams()
+     *
+     * @return bool
+     */
+    public function stateParamRequired()
+    {
+        return $this->requireStateParam;
+    }
+
+    /**
+     * Require the "state" parameter in checkAuthoriseParams()
+     *
+     * @param boolean $require
+     *
+     * @return self
+     */
+    public function requireStateParam($require = true)
+    {
+        $this->requireStateParam = $require;
+
+        return $this;
+    }
+
+    /**
+     * Get the scope delimiter
+     *
+     * @return string The scope delimiter (default: ",")
+     */
+    public function getScopeDelimiter()
+    {
+        return $this->scopeDelimiter;
+    }
+
+    /**
+     * Set the scope delimiter
+     *
+     * @param string $scopeDelimiter
+     *
+     * @return self
+     */
+    public function setScopeDelimiter($scopeDelimiter = ' ')
+    {
+        $this->scopeDelimiter = $scopeDelimiter;
+
+        return $this;
+    }
+
+    /**
+     * Get the TTL for an access token
+     *
+     * @return int The TTL
+     */
+    public function getAccessTokenTTL()
+    {
+        return $this->accessTokenTTL;
+    }
+
+    /**
+     * Set the TTL for an access token
+     *
+     * @param int $accessTokenTTL The new TTL
+     *
+     * @return self
+     */
+    public function setAccessTokenTTL($accessTokenTTL = 3600)
+    {
+        $this->accessTokenTTL = $accessTokenTTL;
+
+        return $this;
+    }
+
+    /**
+     * Issue an access token
+     *
+     * @return array Authorise request parameters
+     *
+     * @throws
+     */
+    public function issueAccessToken()
+    {
+        $grantType = $this->getRequest()->get('grant_type');
+        if (is_null($grantType)) {
+            throw new Exception\InvalidRequestException('grant_type');
         }
 
-        throw OAuthServerException::unsupportedGrantType();
-    }
-
-    /**
-     * Get the token type that grants will return in the HTTP response.
-     *
-     * @return ResponseTypeInterface
-     */
-    protected function getResponseType()
-    {
-        $responseType = clone $this->responseType;
-
-        if ($responseType instanceof AbstractResponseType) {
-            $responseType->setPrivateKey($this->privateKey);
+        // Ensure grant type is one that is recognised and is enabled
+        if (!in_array($grantType, array_keys($this->grantTypes))) {
+            throw new Exception\UnsupportedGrantTypeException($grantType);
         }
 
-        $responseType->setEncryptionKey($this->encryptionKey);
-
-        return $responseType;
+        // Complete the flow
+        return $this->getGrantType($grantType)->completeFlow();
     }
 
     /**
-     * Set the default scope for the authorization server.
+     * Return a grant type class
      *
-     * @param string $defaultScope
+     * @param string $grantType The grant type identifier
+     *
+     * @return Grant\GrantTypeInterface
+     *
+     * @throws
      */
-    public function setDefaultScope($defaultScope)
+    public function getGrantType($grantType)
     {
-        $this->defaultScope = $defaultScope;
+        if (isset($this->grantTypes[$grantType])) {
+            return $this->grantTypes[$grantType];
+        }
+
+        throw new Exception\InvalidGrantException($grantType);
     }
 }

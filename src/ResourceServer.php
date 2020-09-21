@@ -1,86 +1,157 @@
 <?php
 /**
+ * OAuth 2.0 Resource Server
+ *
+ * @package     league/oauth2-server
  * @author      Alex Bilbie <hello@alexbilbie.com>
  * @copyright   Copyright (c) Alex Bilbie
  * @license     http://mit-license.org/
- *
  * @link        https://github.com/thephpleague/oauth2-server
  */
 
 namespace League\OAuth2\Server;
 
-use League\OAuth2\Server\AuthorizationValidators\AuthorizationValidatorInterface;
-use League\OAuth2\Server\AuthorizationValidators\BearerTokenValidator;
-use League\OAuth2\Server\Exception\OAuthServerException;
-use League\OAuth2\Server\Repositories\AccessTokenRepositoryInterface;
-use Psr\Http\Message\ServerRequestInterface;
+use League\OAuth2\Server\Entity\AccessTokenEntity;
+use League\OAuth2\Server\Exception\AccessDeniedException;
+use League\OAuth2\Server\Exception\InvalidRequestException;
+use League\OAuth2\Server\Storage\AccessTokenInterface;
+use League\OAuth2\Server\Storage\ClientInterface;
+use League\OAuth2\Server\Storage\ScopeInterface;
+use League\OAuth2\Server\Storage\SessionInterface;
+use League\OAuth2\Server\TokenType\Bearer;
+use League\OAuth2\Server\TokenType\MAC;
 
-class ResourceServer
+/**
+ * OAuth 2.0 Resource Server
+ */
+class ResourceServer extends AbstractServer
 {
     /**
-     * @var AccessTokenRepositoryInterface
-     */
-    private $accessTokenRepository;
-
-    /**
-     * @var CryptKey
-     */
-    private $publicKey;
-
-    /**
-     * @var null|AuthorizationValidatorInterface
-     */
-    private $authorizationValidator;
-
-    /**
-     * New server instance.
+     * The access token
      *
-     * @param AccessTokenRepositoryInterface       $accessTokenRepository
-     * @param CryptKey|string                      $publicKey
-     * @param null|AuthorizationValidatorInterface $authorizationValidator
+     * @var \League\OAuth2\Server\Entity\AccessTokenEntity
+     */
+    protected $accessToken;
+
+    /**
+     * The query string key which is used by clients to present the access token (default: access_token)
+     *
+     * @var string
+     */
+    protected $tokenKey = 'access_token';
+
+    /**
+     * Initialise the resource server
+     *
+     * @param \League\OAuth2\Server\Storage\SessionInterface     $sessionStorage
+     * @param \League\OAuth2\Server\Storage\AccessTokenInterface $accessTokenStorage
+     * @param \League\OAuth2\Server\Storage\ClientInterface      $clientStorage
+     * @param \League\OAuth2\Server\Storage\ScopeInterface       $scopeStorage
+     *
+     * @return self
      */
     public function __construct(
-        AccessTokenRepositoryInterface $accessTokenRepository,
-        $publicKey,
-        AuthorizationValidatorInterface $authorizationValidator = null
+        SessionInterface $sessionStorage,
+        AccessTokenInterface $accessTokenStorage,
+        ClientInterface $clientStorage,
+        ScopeInterface $scopeStorage
     ) {
-        $this->accessTokenRepository = $accessTokenRepository;
+        $this->setSessionStorage($sessionStorage);
+        $this->setAccessTokenStorage($accessTokenStorage);
+        $this->setClientStorage($clientStorage);
+        $this->setScopeStorage($scopeStorage);
 
-        if ($publicKey instanceof CryptKey === false) {
-            $publicKey = new CryptKey($publicKey);
-        }
-        $this->publicKey = $publicKey;
+        // Set Bearer as the default token type
+        $this->setTokenType(new Bearer());
 
-        $this->authorizationValidator = $authorizationValidator;
+        parent::__construct();
+
+        return $this;
     }
 
     /**
-     * @return AuthorizationValidatorInterface
+     * Sets the query string key for the access token.
+     *
+     * @param string $key The new query string key
+     *
+     * @return self
      */
-    protected function getAuthorizationValidator()
+    public function setIdKey($key)
     {
-        if ($this->authorizationValidator instanceof AuthorizationValidatorInterface === false) {
-            $this->authorizationValidator = new BearerTokenValidator($this->accessTokenRepository);
-        }
+        $this->tokenKey = $key;
 
-        if ($this->authorizationValidator instanceof BearerTokenValidator === true) {
-            $this->authorizationValidator->setPublicKey($this->publicKey);
-        }
-
-        return $this->authorizationValidator;
+        return $this;
     }
 
     /**
-     * Determine the access token validity.
+     * Gets the access token
      *
-     * @param ServerRequestInterface $request
-     *
-     * @throws OAuthServerException
-     *
-     * @return ServerRequestInterface
+     * @return \League\OAuth2\Server\Entity\AccessTokenEntity
      */
-    public function validateAuthenticatedRequest(ServerRequestInterface $request)
+    public function getAccessToken()
     {
-        return $this->getAuthorizationValidator()->validateAuthorization($request);
+        return $this->accessToken;
+    }
+
+    /**
+     * Checks if the access token is valid or not
+     *
+     * @param bool                                                $headerOnly Limit Access Token to Authorization header
+     * @param \League\OAuth2\Server\Entity\AccessTokenEntity|null $accessToken Access Token
+     *
+     * @throws \League\OAuth2\Server\Exception\AccessDeniedException
+     * @throws \League\OAuth2\Server\Exception\InvalidRequestException
+     *
+     * @return bool
+     */
+    public function isValidRequest($headerOnly = true, $accessToken = null)
+    {
+        $accessTokenString = ($accessToken !== null)
+                                ? $accessToken
+                                : $this->determineAccessToken($headerOnly);
+
+        // Set the access token
+        $this->accessToken = $this->getAccessTokenStorage()->get($accessTokenString);
+
+        // Ensure the access token exists
+        if (!$this->accessToken instanceof AccessTokenEntity) {
+            throw new AccessDeniedException();
+        }
+
+        // Check the access token hasn't expired
+        // Ensure the auth code hasn't expired
+        if ($this->accessToken->isExpired() === true) {
+            throw new AccessDeniedException();
+        }
+
+        return true;
+    }
+
+    /**
+     * Reads in the access token from the headers
+     *
+     * @param bool $headerOnly Limit Access Token to Authorization header
+     *
+     * @throws \League\OAuth2\Server\Exception\InvalidRequestException Thrown if there is no access token presented
+     *
+     * @return string
+     */
+    public function determineAccessToken($headerOnly = false)
+    {
+	$authHeader = $this->getRequest()->headers->get('Authorization');
+
+        if (!empty($authHeader)) {
+            $accessToken = $this->getTokenType()->determineAccessTokenInHeader($this->getRequest());
+        } elseif ($headerOnly === false && (! $this->getTokenType() instanceof MAC)) {
+            $accessToken = ($this->getRequest()->server->get('REQUEST_METHOD') === 'GET')
+                                ? $this->getRequest()->query->get($this->tokenKey)
+                                : $this->getRequest()->get($this->tokenKey);
+        }
+
+        if (empty($accessToken)) {
+            throw new InvalidRequestException('access token');
+        }
+
+        return $accessToken;
     }
 }
