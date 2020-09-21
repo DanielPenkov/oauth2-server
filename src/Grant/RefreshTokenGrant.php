@@ -142,7 +142,7 @@ class RefreshTokenGrant extends AbstractGrant
             throw new Exception\InvalidClientException();
         }
 
-        $oldRefreshTokenParam = $this->server->getRequest()->get('refresh_token', null);
+        $oldRefreshTokenParam = $this->  server->getRequest()->get('refresh_token', null);
         if ($oldRefreshTokenParam === null) {
             throw new Exception\InvalidRequestException('refresh_token');
         }

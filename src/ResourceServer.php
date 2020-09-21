@@ -145,7 +145,7 @@ class ResourceServer extends AbstractServer
         } elseif ($headerOnly === false && (! $this->getTokenType() instanceof MAC)) {
             $accessToken = ($this->getRequest()->server->get('REQUEST_METHOD') === 'GET')
                                 ? $this->getRequest()->query->get($this->tokenKey)
-                                : $this->getRequest()->get($this->tokenKey);
+                                : $this->getRequest()->request->get($this->tokenKey);
         }
 
         if (empty($accessToken)) {

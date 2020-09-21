@@ -111,12 +111,12 @@ class AuthCodeGrant extends AbstractGrant
     public function checkAuthorizeParams()
     {
         // Get required params
-        $clientId = $this->server->getRequest()->query->get('client_id', null);
+        $clientId = $this->server->getRequest()->get('client_id', null);
         if (is_null($clientId)) {
             throw new Exception\InvalidRequestException('client_id');
         }
 
-        $redirectUri = $this->server->getRequest()->query->get('redirect_uri', null);
+        $redirectUri = $this->server->getRequest()->get('redirect_uri', null);
         if (is_null($redirectUri)) {
             throw new Exception\InvalidRequestException('redirect_uri');
         }
@@ -134,12 +134,12 @@ class AuthCodeGrant extends AbstractGrant
             throw new Exception\InvalidClientException();
         }
 
-        $state = $this->server->getRequest()->query->get('state', null);
+        $state = $this->server->getRequest()->get('state', null);
         if ($this->server->stateParamRequired() === true && is_null($state)) {
             throw new Exception\InvalidRequestException('state', $redirectUri);
         }
 
-        $responseType = $this->server->getRequest()->query->get('response_type', null);
+        $responseType = $this->server->getRequest()->get('response_type', null);
         if (is_null($responseType)) {
             throw new Exception\InvalidRequestException('response_type', $redirectUri);
         }
@@ -150,7 +150,7 @@ class AuthCodeGrant extends AbstractGrant
         }
 
         // Validate any scopes that are in the request
-        $scopeParam = $this->server->getRequest()->query->get('scope', '');
+        $scopeParam = $this->server->getRequest()->get('scope', '');
         $scopes = $this->validateScopes($scopeParam, $client, $redirectUri);
 
         return [
